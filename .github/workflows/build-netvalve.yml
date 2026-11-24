@@ -70,6 +70,178 @@ jobs:
           unzip -l app/libs/netstack.aar | tee /tmp/aar-listing.txt
           grep -q 'jni/arm64-v8a/.*\.so' /tmp/aar-listing.txt || { echo "::error::netstack.aar has no arm64-v8a native library"; exit 1; }
 
+      - name: Generate AndroidManifest.xml if missing
+        run: |
+          python3 - <<'PY'
+          import os, re, sys, pathlib
+
+          root = pathlib.Path("app")
+          mf = root / "src/main/AndroidManifest.xml"
+          if mf.exists():
+              print("AndroidManifest.xml already exists; nothing to generate.")
+              sys.exit(0)
+
+          gp = root / "build.gradle.kts"
+          gradle = gp.read_text(errors="ignore") if gp.exists() else ""
+          m = re.search(r'namespace\s*=\s*"([^"]+)"', gradle)
+          namespace = m.group(1) if m else "dev.netvalve"
+
+          src = root / "src/main"
+          files = list(src.rglob("*.kt"))
+          if not files:
+              print("::error::No Kotlin sources under app/src/main; cannot generate a manifest")
+              sys.exit(1)
+
+          SUPERS = {
+              "application": r'(?<![\w.])Application\s*\(',
+              "activity": r'(?<![\w.])(?:ComponentActivity|AppCompatActivity|FragmentActivity|Activity)\s*\(',
+              "vpn": r'(?<![\w.])VpnService\s*\(',
+              "receiver": r'(?<![\w.])BroadcastReceiver\s*\(',
+              "service": r'(?<![\w.])(?:LifecycleService|Service)\s*\(',
+          }
+          found = {k: set() for k in SUPERS}
+          all_text = ""
+          for p in files:
+              t = p.read_text(errors="ignore")
+              all_text += t + "\n"
+              pm = re.search(r'^\s*package\s+([\w.]+)', t, re.M)
+              pkg = pm.group(1) if pm else ""
+              classes = list(re.finditer(r'(?<![\w:.])class\s+(\w+)', t))
+              for kind, pat in SUPERS.items():
+                  for sm in re.finditer(pat, t):
+                      prev = [c for c in classes if c.end() <= sm.start()]
+                      if not prev:
+                          continue
+                      c = prev[-1]
+                      between = t[c.end():sm.start()]
+                      if "{" in between or ":" not in between:
+                          continue
+                      before = t[max(0, c.start() - 40):c.start()]
+                      if re.search(r'\babstract\s+(?:\w+\s+)*$', before):
+                          continue
+                      name = c.group(1)
+                      found[kind].add(pkg + "." + name if pkg else name)
+
+          print("Detected classes:")
+          for k, v in found.items():
+              print("  " + k + ": " + ", ".join(sorted(v)))
+
+          if not found["vpn"]:
+              print("::error::No VpnService subclass found in app/src/main; cannot generate manifest")
+              sys.exit(1)
+          if not found["activity"]:
+              print("::error::No Activity found in app/src/main; cannot generate manifest")
+              sys.exit(1)
+          if not found["application"]:
+              print("::warning::No Application subclass found; Hilt may fail at runtime")
+
+          camel = {
+              "SYSTEM_EXEMPTED": "systemExempted",
+              "SPECIAL_USE": "specialUse",
+              "CONNECTED_DEVICE": "connectedDevice",
+              "DATA_SYNC": "dataSync",
+              "REMOTE_MESSAGING": "remoteMessaging",
+          }
+          fg = sorted({k for k in re.findall(r'FOREGROUND_SERVICE_TYPE_([A-Z_]+)', all_text) if k in camel})
+          if not fg:
+              fg = ["SYSTEM_EXEMPTED"]
+          fg_attr = "|".join(camel[k] for k in fg)
+
+          res = src / "res"
+          def has_res(prefix, stem):
+              return any(p.stem == stem for d in res.glob(prefix + "*") for p in d.glob("*"))
+          values_text = "".join(p.read_text(errors="ignore") for p in res.glob("values*/*.xml"))
+          label = "@string/app_name" if 'name="app_name"' in values_text else "NetValve"
+          styles = []
+          for s in re.findall(r'<style\s+name="([^"]+)"', values_text):
+              if s not in styles:
+                  styles.append(s)
+          theme = None
+          for s in styles:
+              if "NetValve" in s and "Splash" not in s:
+                  theme = "@style/" + s
+                  break
+          if theme is None:
+              for s in styles:
+                  if "Theme" in s and "Splash" not in s:
+                      theme = "@style/" + s
+                      break
+          if theme is None:
+              theme = "@android:style/Theme.Material.NoActionBar"
+
+          app_attrs = ['android:allowBackup="false"', 'android:label="' + label + '"', 'android:supportsRtl="true"']
+          if has_res("mipmap", "ic_launcher"):
+              app_attrs.append('android:icon="@mipmap/ic_launcher"')
+              if has_res("mipmap", "ic_launcher_round"):
+                  app_attrs.append('android:roundIcon="@mipmap/ic_launcher_round"')
+          elif has_res("drawable", "ic_launcher"):
+              app_attrs.append('android:icon="@drawable/ic_launcher"')
+          app_attrs.append('android:theme="' + theme + '"')
+          if found["application"]:
+              app_attrs.insert(0, 'android:name="' + sorted(found["application"])[0] + '"')
+
+          perms = ["INTERNET", "ACCESS_NETWORK_STATE", "ACCESS_WIFI_STATE", "FOREGROUND_SERVICE",
+                   "POST_NOTIFICATIONS", "RECEIVE_BOOT_COMPLETED", "QUERY_ALL_PACKAGES",
+                   "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"]
+          perms += ["FOREGROUND_SERVICE_" + k for k in fg]
+          for pr in re.findall(r'(?:android\.permission|Manifest\.permission)\.([A-Z_]+)', all_text):
+              if pr not in perms and pr != "BIND_VPN_SERVICE":
+                  perms.append(pr)
+
+          acts = sorted(found["activity"])
+          launcher = next((a for a in acts if a.endswith(".MainActivity") or a == "MainActivity"), acts[0])
+
+          out = ['<?xml version="1.0" encoding="utf-8"?>',
+                 '<manifest xmlns:android="http://schemas.android.com/apk/res/android">', '']
+          for pr in perms:
+              out.append('    <uses-permission android:name="android.permission.' + pr + '" />')
+          out += ['', '    <application', *['        ' + a for a in app_attrs[:-1]],
+                  '        ' + app_attrs[-1] + '>', '']
+          for a in acts:
+              if a == launcher:
+                  out += ['        <activity android:name="' + a + '" android:exported="true">',
+                          '            <intent-filter>',
+                          '                <action android:name="android.intent.action.MAIN" />',
+                          '                <category android:name="android.intent.category.LAUNCHER" />',
+                          '            </intent-filter>',
+                          '        </activity>']
+              else:
+                  out.append('        <activity android:name="' + a + '" android:exported="false" />')
+          for s in sorted(found["vpn"]):
+              out += ['        <service',
+                      '            android:name="' + s + '"',
+                      '            android:exported="true"',
+                      '            android:permission="android.permission.BIND_VPN_SERVICE"',
+                      '            android:foregroundServiceType="' + fg_attr + '">',
+                      '            <intent-filter>',
+                      '                <action android:name="android.net.VpnService" />',
+                      '            </intent-filter>']
+              if "SPECIAL_USE" in fg:
+                  out += ['            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"',
+                          '                android:value="vpn" />']
+              out.append('        </service>')
+          for s in sorted(found["service"]):
+              out.append('        <service android:name="' + s + '" android:exported="false" />')
+          for r in sorted(found["receiver"]):
+              if "boot" in r.lower():
+                  out += ['        <receiver android:name="' + r + '" android:exported="true">',
+                          '            <intent-filter>',
+                          '                <action android:name="android.intent.action.BOOT_COMPLETED" />',
+                          '            </intent-filter>',
+                          '        </receiver>']
+              else:
+                  out.append('        <receiver android:name="' + r + '" android:exported="false" />')
+          out += ['', '    </application>', '', '</manifest>', '']
+
+          mf.write_text("\n".join(out))
+          print("---- GENERATED app/src/main/AndroidManifest.xml ----")
+          print(mf.read_text())
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("MANIFEST_GENERATED=true\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("### Warning\nAndroidManifest.xml was missing in the repository and was GENERATED by this workflow from the sources. It is not the author's original file.\n")
+          PY
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
@@ -92,6 +264,9 @@ jobs:
 
           mkdir -p dist /tmp/apkchk
           cp "$APK" "dist/$APK_NAME"
+          if [ "${MANIFEST_GENERATED:-}" = "true" ]; then
+            cp app/src/main/AndroidManifest.xml dist/generated-AndroidManifest.xml
+          fi
           unzip -l "$APK" > dist/apk-listing.txt
 
           grep -E 'lib/arm64-v8a/.*\.so' dist/apk-listing.txt > /tmp/arm64-libs.txt || {
@@ -119,6 +294,9 @@ jobs:
             echo "- libgojni.so: AArch64, gVisor matches = $GV"
             echo "- Unit tests: passed"
             echo "- SHA-256: \`$(cut -d' ' -f1 dist/SHA256SUMS.txt)\`"
+            if [ "${MANIFEST_GENERATED:-}" = "true" ]; then
+              echo "- WARNING: AndroidManifest.xml was generated by this workflow, not taken from the repository"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload APK
@@ -129,6 +307,7 @@ jobs:
             dist/app-netstack-arm64-debug.apk
             dist/SHA256SUMS.txt
             dist/apk-listing.txt
+            dist/generated-AndroidManifest.xml
           if-no-files-found: error
 
       - name: Upload test reports
