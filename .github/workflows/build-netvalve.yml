@@ -62,6 +62,7 @@ jobs:
         run: |
           chmod +x netstack/build-aar.sh gradlew
           cd netstack
+          go get -tool golang.org/x/mobile/cmd/gobind
           ./build-aar.sh
           cd ..
           test -f app/libs/netstack.aar || { echo "::error::app/libs/netstack.aar was not produced"; exit 1; }
