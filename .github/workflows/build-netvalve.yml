@@ -1,0 +1,141 @@
+name: Build NetValve (Netstack ARM64)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: netvalve-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: auto
+  NDK_VERSION: "27.2.12479018"
+  BUILD_TOOLS_VERSION: "35.0.0"
+  APK_NAME: app-netstack-arm64-debug.apk
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          check-latest: true
+          cache-dependency-path: netstack/go.sum
+
+      - name: Install Android SDK platform, build-tools and NDK
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-35" "build-tools;${BUILD_TOOLS_VERSION}" "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Install gomobile and gobind
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          gomobile init
+          go version
+          gomobile version || true
+
+      - name: Build netstack AAR (gVisor)
+        run: |
+          chmod +x netstack/build-aar.sh gradlew
+          cd netstack
+          ./build-aar.sh
+          cd ..
+          test -f app/libs/netstack.aar || { echo "::error::app/libs/netstack.aar was not produced"; exit 1; }
+          ls -l app/libs/netstack.aar
+          unzip -l app/libs/netstack.aar | tee /tmp/aar-listing.txt
+          grep -q 'jni/arm64-v8a/.*\.so' /tmp/aar-listing.txt || { echo "::error::netstack.aar has no arm64-v8a native library"; exit 1; }
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run unit tests
+        run: ./gradlew :app:testDebugUnitTest --stacktrace
+
+      - name: Build APK with netstack engine
+        run: ./gradlew :app:assembleDebug -Pnetvalve.netstack=true --stacktrace
+
+      - name: Verify APK is the real Netstack ARM64 build
+        run: |
+          set -euo pipefail
+          APK="$(find app/build/outputs/apk -type f -name "$APK_NAME" -print -quit)"
+          if [ -z "$APK" ]; then
+            echo "::error::$APK_NAME not found. This means the netstack variant was NOT built (possibly Loopback)."
+            find app/build/outputs -name '*.apk' -print || true
+            exit 1
+          fi
+          echo "Found: $APK"
+
+          mkdir -p dist /tmp/apkchk
+          cp "$APK" "dist/$APK_NAME"
+          unzip -l "$APK" > dist/apk-listing.txt
+
+          grep -E 'lib/arm64-v8a/.*\.so' dist/apk-listing.txt > /tmp/arm64-libs.txt || {
+            echo "::error::No lib/arm64-v8a/*.so inside the APK"; exit 1; }
+          cat /tmp/arm64-libs.txt
+
+          grep -q 'lib/arm64-v8a/libgojni.so' dist/apk-listing.txt || {
+            echo "::error::libgojni.so (gomobile/Go netstack bridge) missing from APK"; exit 1; }
+
+          unzip -o -q "$APK" 'lib/arm64-v8a/libgojni.so' -d /tmp/apkchk
+          SO=/tmp/apkchk/lib/arm64-v8a/libgojni.so
+          readelf -h "$SO" > /tmp/readelf.txt
+          grep -q 'AArch64' /tmp/readelf.txt || { echo "::error::libgojni.so is not AArch64"; exit 1; }
+          strings -a "$SO" > /tmp/so-strings.txt
+          GV="$(grep -ci 'gvisor' /tmp/so-strings.txt || true)"
+          echo "gvisor string matches in libgojni.so: $GV"
+          [ "${GV:-0}" -gt 0 ] || { echo "::error::No gVisor symbols found in libgojni.so"; exit 1; }
+
+          "$ANDROID_HOME/build-tools/${BUILD_TOOLS_VERSION}/apksigner" verify --print-certs "$APK"
+
+          (cd dist && sha256sum "$APK_NAME" > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          {
+            echo "### NetValve Netstack ARM64 build verified"
+            echo "- APK: \`$APK_NAME\` ($(du -h "dist/$APK_NAME" | cut -f1))"
+            echo "- libgojni.so: AArch64, gVisor matches = $GV"
+            echo "- Unit tests: passed"
+            echo "- SHA-256: \`$(cut -d' ' -f1 dist/SHA256SUMS.txt)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetValve-netstack-arm64-debug
+          path: |
+            dist/app-netstack-arm64-debug.apk
+            dist/SHA256SUMS.txt
+            dist/apk-listing.txt
+          if-no-files-found: error
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            app/build/reports/tests
+            app/build/test-results
+          if-no-files-found: ignore
